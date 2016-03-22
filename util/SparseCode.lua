@@ -9,7 +9,7 @@ function SparseCode:updateOutput(input)
   self.output:resize(self.outputSize):zero():float()
   local longInput = input:long()
   for i=1, input:size(1) do
-    self.output[input[i]] = 1
+    self.output[input[i]] = self.output[input[i]] + 1
   end
   return self.output
 end
