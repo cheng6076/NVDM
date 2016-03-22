@@ -2,26 +2,23 @@ require 'torch'
 require 'nn'
 require 'nngraph'
 require 'optim'
-require 'util.OneHot'
 require 'util.SparseCode'
 require 'util.KLDCriterion'
 require 'util.Sampler'
 model_utils = require 'util.model_utils'
 Loader = require 'util.Loader'
 require 'util.misc'
-enc = require 'model.enc'
-dec = require 'model.dec'
 cmd = torch.CmdLine()
 cmd:text()
 cmd:text('Options')
-cmd:option('-data_dir', 'dataset/20news/', 'path of the dataset')
+cmd:option('-data_dir', '/afs/inf.ed.ac.uk/user/s15/s1537177/20news/', 'path of the dataset')
 cmd:option('-max_epochs', 50, 'number of full passes through the training data')
 cmd:option('-ntopics', 50, 'dimensionality of word embeddings')
 cmd:option('-batch_size', 10, 'number of words in a mini-batch')
 cmd:option('-hidden', 500, 'number of words in a mini-batch')
 cmd:option('-dropout',0.5,'dropout. 0 = no dropout')
 cmd:option('-coefL2',0.001,'regularization constanti for l2 norm.')
-cmd:option('-seed',3435,'torch manual random number generator seed')
+cmd:option('-seed',123,'torch manual random number generator seed')
 cmd:option('-print_every',100,'how many steps/minibatches between printing out the loss')
 cmd:option('-save_every', 8000, 'save when seeing n examples')
 cmd:option('-checkpoint_dir', 'cv', 'output directory where checkpoints get written')
@@ -60,16 +57,14 @@ end
 -- create data loader
 loader = Loader.create(opt.data_dir)
 opt.vocab_size = #loader.idx2word
-local OneHot = nn.OneHot(opt.vocab_size)
 local SparseCode = nn.SparseCode(opt.vocab_size)
 
 -- model
 protos = {}
-protos.enc1 = enc.mlp(opt.vocab_size, opt.hidden)
-protos.enc2 = enc.mlp(opt.hidden, opt.hidden)
-protos.enc_mean = enc.mlp(opt.hidden, opt.ntopics)
-protos.enc_var = enc.mlp(opt.hidden, opt.ntopics)
-protos.dec = dec.mlp(opt.ntopics, opt.vocab_size)
+protos.enc = nn.Sequential():add(nn.Linear(opt.vocab_size,opt.hidden)):add(nn.ReLU()):add(nn.Linear(opt.hidden,opt.hidden)):add(nn.ReLU()):add(nn.ConcatTable():add(nn.Linear(opt.hidden, opt.ntopics)):add(nn.Linear(opt.hidden, opt.ntopics)))
+word_vec_layer = nn.Linear(opt.ntopics,opt.vocab_size)
+word_vec_layer.name = 'word_vec'
+protos.dec = nn.Sequential():add(word_vec_layer):add(nn.LogSoftMax())
 protos.sampler = nn.Sampler()
 protos.Criterion = nn.ClassNLLCriterion()
 protos.KLD = nn.KLDCriterion()
@@ -78,7 +73,7 @@ if opt.gpuid >= 0 then
   for k,v in pairs(protos) do v:cuda() end
 end
 -- params and grads
-params, grad_params = model_utils.combine_all_parameters(protos.enc1, protos.enc2, protos.enc_mean, protos.enc_var, protos.dec)
+params, grad_params = model_utils.combine_all_parameters(protos.enc, protos.dec)
 params:uniform(-0.01, 0.01)
 print('number of parameters in the model: ' .. params:nElement())
 
@@ -107,10 +102,7 @@ function eval_split()
       label = label:cuda()
     end
     -- Forward pass
-    local hidden1 = protos.enc1:forward(d)
-    local hidden2 = protos.enc2:forward(hidden1)
-    local theta_mean = protos.enc_mean:forward(hidden2)
-    local theta_var = protos.enc_var:forward(hidden2)
+    local theta_mean, theta_var = unpack(protos.enc:forward(d))
     local kld = protos.KLD:forward(theta_mean, theta_var)
     local theta = protos.sampler:forward({theta_mean, theta_var})
     for i=1, 19 do
@@ -143,13 +135,9 @@ function feval(x)
     label = label:cuda()
   end
   -- Forward pass
-  local hidden1 = protos.enc1:forward(d)
-  local hidden2 = protos.enc2:forward(hidden1)
-  local theta_mean = protos.enc_mean:forward(hidden2)
-  local theta_var = protos.enc_var:forward(hidden2)
+  local theta_mean, theta_var = unpack(protos.enc:forward(d))
   local theta = protos.sampler:forward({theta_mean, theta_var})
-  local kld_theta = protos.KLD:forward(theta_mean, theta_var)
-  
+  local kld_theta = protos.KLD:forward(theta_mean, theta_var)  
   local theta_all = torch.repeatTensor(theta, label:size(1), 1)
   local w_p = protos.dec:forward(theta_all)
   local w_error = protos.Criterion:forward(w_p, label)
@@ -157,17 +145,14 @@ function feval(x)
   -- Backward pass
   local der_wp = protos.Criterion:backward(w_p, label)
   local der_theta_all = protos.dec:backward(theta_all, der_wp)
-  local der_theta = der_theta_all:sum(1)
+  local der_theta = der_theta_all:sum(1):squeeze()
 
   local der_sampler = protos.sampler:backward({theta_mean, theta_var}, der_theta)
   local der_theta_mean, der_theta_var = der_sampler[1], der_sampler[2]
   local der_kld = protos.KLD:backward(theta_mean, theta_var)
   der_theta_mean:add(der_kld[1])
   der_theta_var:add(der_kld[2])
-  local der_hidden2 = protos.enc_mean:backward(hidden2, der_theta_mean)
-  der_hidden2:add(protos.enc_var:backward(hidden2, der_theta_var))
-  local der_hidden1 = protos.enc2:backward(hidden1, der_hidden2)
-  local der_d = protos.enc1:backward(d, der_hidden1)
+  local der_d = protos.enc:backward(d, {der_theta_mean, der_theta_var})
 
   local grad_norm, shrink_factor
   grad_norm = torch.sqrt(grad_params:norm()^2)
